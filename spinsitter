@@ -1,0 +1,128 @@
+#!/bin/sh
+# spinsitter: keeps external spinning hard drives on a Mac from going to sleep.
+# https://github.com/partytimeexcellent/spinsitter
+#
+#   ./spinsitter install [seconds]   start keeping drives awake (default: every 60s)
+#   ./spinsitter status              show which drives are kept awake
+#   ./spinsitter uninstall           stop and remove everything
+#
+# Every interval it writes a timestamp to a hidden file (.spinsitter) on each
+# attached external drive that isn't an SSD. To let one drive sleep, put an
+# empty file named .spinsitter-sleep on it.
+
+set -u
+
+LABEL=io.github.partytimeexcellent.spinsitter
+DEST="$HOME/Library/Application Support/spinsitter/spinsitter"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+HEARTBEAT=.spinsitter
+OPTOUT=.spinsitter-sleep
+DOMAIN="gui/$(id -u)"
+
+field() { printf '%s\n' "$info" | sed -n "s/^ *$1: *//p" | head -n 1; }
+
+# Prints why a volume is skipped, or nothing if it should be kept awake.
+# Drives that don't say whether they're solid state (RAID sets, some USB
+# adapters) count as spinning if they're over 64 GB, so small flash and
+# firmware devices are left alone.
+skip_reason() {
+  [ -e "$1/$OPTOUT" ] && { echo "opted out"; return; }
+  info=$(diskutil info "$1" 2>/dev/null) || { echo "not a local disk"; return; }
+  [ "$(field 'Device Location')" = External ] || { echo "internal"; return; }
+  [ "$(field 'Volume Read-Only')" = No ] || { echo "read-only"; return; }
+  [ "$(field 'Protocol')" != 'Disk Image' ] || { echo "disk image"; return; }
+  case $(field 'Solid State') in
+    Yes) echo "SSD" ;;
+    No) ;;
+    *) bytes=$(field 'Disk Size' | sed -n 's/.*(\([0-9]*\) Bytes).*/\1/p')
+       [ "${bytes:-0}" -gt 64000000000 ] || echo "small drive of unknown type" ;;
+  esac
+}
+
+run() {
+  for v in /Volumes/*; do
+    [ -d "$v" ] && [ -z "$(skip_reason "$v")" ] || continue
+    f="$v/$HEARTBEAT"
+    [ -L "$f" ] || date '+%F %T %Z' > "$f" 2>/dev/null
+  done
+}
+
+status() {
+  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    echo "spinsitter is on, checking every $(plutil -extract StartInterval raw "$PLIST" 2>/dev/null || echo '?') seconds."
+  else
+    echo "spinsitter is not installed."
+  fi
+  for v in /Volumes/*; do
+    case $v in /Volumes/com.apple.*) continue ;; esac  # macOS's own snapshot mounts
+    [ -d "$v" ] || continue
+    r=$(skip_reason "$v")
+    if [ -z "$r" ]; then
+      r="kept awake (last write: $(cat "$v/$HEARTBEAT" 2>/dev/null || echo 'not yet'))"
+    else
+      r="skipped: $r"
+    fi
+    printf '  %-28s %s\n' "$(basename "$v")" "$r"
+  done
+}
+
+install() {
+  interval=${1:-60}
+  case $interval in ''|*[!0-9]*) echo "The interval must be a number of seconds." >&2; exit 1 ;; esac
+  [ "$interval" -ge 10 ] || { echo "The interval must be at least 10 seconds." >&2; exit 1; }
+
+  mkdir -p "$(dirname "$DEST")" "$(dirname "$PLIST")"
+  [ "$0" -ef "$DEST" ] || cp "$0" "$DEST"
+  chmod 755 "$DEST"
+
+  dest_xml=$(printf '%s' "$DEST" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$dest_xml</string>
+    <string>run</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>$interval</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
+EOF
+  launchctl bootstrap "$DOMAIN" "$PLIST" || exit 1
+
+  # Turn off the Keep Drive Spinning app's background job if it's there.
+  old="$HOME/Library/LaunchAgents/info.stovell.KeepDriveSpinning_agent.plist"
+  if [ -f "$old" ]; then
+    launchctl bootout "$DOMAIN/info.stovell.KeepDriveSpinning_agent" 2>/dev/null
+    rm -f "$old"
+    echo "Turned off Keep Drive Spinning's background job."
+  fi
+
+  sleep 1
+  status
+}
+
+uninstall() {
+  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null
+  rm -f "$PLIST"
+  rm -rf "$(dirname "$DEST")"
+  echo "spinsitter is uninstalled. The hidden .spinsitter files left on your drives are harmless; delete them if you like."
+}
+
+case ${1:-} in
+  run) run ;;
+  install) shift; install "$@" ;;
+  uninstall) uninstall ;;
+  status) status ;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
